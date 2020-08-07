@@ -9,7 +9,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/juju/errors"
-	log "github.com/sirupsen/logrus"
+	"github.com/siddontang/go-log/log"
 	"github.com/siddontang/go-mysql/mysql"
 	"github.com/siddontang/go/ioutil2"
 )
@@ -87,8 +87,8 @@ func (m *masterInfo) Position() mysql.Position {
 	defer m.RUnlock()
 
 	return mysql.Position{
-		m.Name,
-		m.Pos,
+		Name: m.Name,
+		Pos:  m.Pos,
 	}
 }
 

@@ -13,8 +13,10 @@ import (
 	"github.com/siddontang/go-mysql/mysql"
 )
 
-var my_addr = flag.String("my_addr", "127.0.0.1:3306", "MySQL addr")
-var es_addr = flag.String("es_addr", "127.0.0.1:9200", "Elasticsearch addr")
+var myAddr = flag.String("my_addr", "127.0.0.1:3306", "MySQL addr")
+var esAddr = flag.String("es_addr", "127.0.0.1:9200", "Elasticsearch addr")
+var dateTimeStr = time.Now().Format(mysql.TimeFormat)
+var dateStr = time.Now().Format(mysqlDateFormat)
 
 func Test(t *testing.T) {
 	TestingT(t)
@@ -29,26 +31,28 @@ var _ = Suite(&riverTestSuite{})
 
 func (s *riverTestSuite) SetUpSuite(c *C) {
 	var err error
-	s.c, err = client.Connect(*my_addr, "root", "", "test")
+	s.c, err = client.Connect(*myAddr, "root", "", "test")
 	c.Assert(err, IsNil)
 
 	s.testExecute(c, "SET SESSION binlog_format = 'ROW'")
 
 	schema := `
         CREATE TABLE IF NOT EXISTS %s (
-            id INT,
-            title VARCHAR(256),
-            content VARCHAR(256),
-            mylist VARCHAR(256),
-            mydate INT(10),
-            tenum ENUM("e1", "e2", "e3"),
-            tset SET("a", "b", "c"),
-            tbit BIT(1) default 1,
-            tdatetime DATETIME DEFAULT NULL,
-            PRIMARY KEY(id)) ENGINE=INNODB;
+					id INT,
+					title VARCHAR(256),
+					content VARCHAR(256),
+					mylist VARCHAR(256),
+					mydate INT(10),
+					tenum ENUM("e1", "e2", "e3"),
+					tset SET("a", "b", "c"),
+					tbit BIT(1) default 1,
+					tdatetime DATETIME DEFAULT NULL,
+					tdate DATE DEFAULT NULL,
+					ip INT UNSIGNED DEFAULT 0,
+					PRIMARY KEY(id)) ENGINE=INNODB;
     `
 
-	schema_json := `
+	schemaJSON := `
 	CREATE TABLE IF NOT EXISTS %s (
 	    id INT,
 	    info JSON,
@@ -60,7 +64,7 @@ func (s *riverTestSuite) SetUpSuite(c *C) {
 	s.testExecute(c, "DROP TABLE IF EXISTS test_for_json")
 	s.testExecute(c, fmt.Sprintf(schema, "test_river"))
 	s.testExecute(c, fmt.Sprintf(schema, "test_for_id"))
-	s.testExecute(c, fmt.Sprintf(schema_json, "test_for_json"))
+	s.testExecute(c, fmt.Sprintf(schemaJSON, "test_for_json"))
 
 	for i := 0; i < 10; i++ {
 		table := fmt.Sprintf("test_river_%04d", i)
@@ -69,11 +73,11 @@ func (s *riverTestSuite) SetUpSuite(c *C) {
 	}
 
 	cfg := new(Config)
-	cfg.MyAddr = *my_addr
+	cfg.MyAddr = *myAddr
 	cfg.MyUser = "root"
 	cfg.MyPassword = ""
 	cfg.MyCharset = "utf8"
-	cfg.ESAddr = *es_addr
+	cfg.ESAddr = *esAddr
 
 	cfg.ServerID = 1001
 	cfg.Flavor = "mysql"
@@ -82,6 +86,8 @@ func (s *riverTestSuite) SetUpSuite(c *C) {
 	cfg.DumpExec = "mysqldump"
 
 	cfg.StatAddr = "127.0.0.1:12800"
+	cfg.StatPath = "/metrics1"
+
 	cfg.BulkSize = 1
 	cfg.FlushBulkTime = TomlDuration{3 * time.Millisecond}
 
@@ -204,6 +210,7 @@ type = "river"
 }
 
 func (s *riverTestSuite) testExecute(c *C, query string, args ...interface{}) {
+	c.Logf("query %s, args: %v", query, args)
 	_, err := s.c.Execute(query, args...)
 	c.Assert(err, IsNil)
 }
@@ -221,8 +228,13 @@ func (s *riverTestSuite) testPrepareData(c *C) {
 		s.testExecute(c, fmt.Sprintf("INSERT INTO %s (id, title, content, tenum, tset) VALUES (?, ?, ?, ?, ?)", table), 5+i, "abc", "hello", "e1", "a,b,c")
 	}
 
-	datetime := time.Now().Format(mysql.TimeFormat)
-	s.testExecute(c, "INSERT INTO test_river (id, title, content, tenum, tset, tdatetime, mydate) VALUES (?, ?, ?, ?, ?, ?, ?)", 16, "test datetime", "hello go 16", "e1", "a,b", datetime, 1458131094)
+	s.testExecute(c, "INSERT INTO test_river (id, title, content, tenum, tset, tdatetime, mydate, tdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 16, "test datetime", "hello go 16", "e1", "a,b", dateTimeStr, 1458131094, dateStr)
+
+	s.testExecute(c, "SET sql_mode = '';") // clear sql_mode to allow empty dates
+	s.testExecute(c, "INSERT INTO test_river (id, title, content, tenum, tset, tdatetime, mydate, tdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 20, "test empty datetime", "date test 20", "e1", "a,b", "0000-00-00 00:00:00", 0, "0000-00-00")
+
+	// test ip
+	s.testExecute(c, "INSERT test_river (id, ip) VALUES (?, ?)", 17, 0)
 }
 
 func (s *riverTestSuite) testElasticGet(c *C, id string) *elastic.Response {
@@ -243,6 +255,7 @@ func (s *riverTestSuite) testElasticMapping(c *C) *elastic.MappingResponse {
 	c.Assert(err, IsNil)
 
 	c.Assert(r.Mapping[index].Mappings[docType].Properties["tdatetime"].Type, Equals, "date")
+	c.Assert(r.Mapping[index].Mappings[docType].Properties["tdate"].Type, Equals, "date")
 	c.Assert(r.Mapping[index].Mappings[docType].Properties["mydate"].Type, Equals, "date")
 	return r
 }
@@ -277,30 +290,30 @@ func (s *riverTestSuite) TestRiver(c *C) {
 
 	var r *elastic.Response
 	r = s.testElasticGet(c, "1")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 	c.Assert(r.Source["tenum"], Equals, "e1")
 	c.Assert(r.Source["tset"], Equals, "a,b")
 
 	r = s.testElasticGet(c, "1:first")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 
 	r = s.testElasticGet(c, "9200")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 	switch v := r.Source["info"].(type) {
 	case map[string]interface{}:
 		c.Assert(v["first"], Equals, "a")
 		c.Assert(v["second"], Equals, "b")
 	default:
-		c.Assert(v, Equals, nil)
-		c.Assert(true, Equals, false)
+		c.Assert(v, IsNil)
+		c.Assert(true, IsFalse)
 	}
 
 	r = s.testElasticGet(c, "100")
-	c.Assert(r.Found, Equals, false)
+	c.Assert(r.Found, IsFalse)
 
 	for i := 0; i < 10; i++ {
 		r = s.testElasticGet(c, fmt.Sprintf("%d", 5+i))
-		c.Assert(r.Found, Equals, true)
+		c.Assert(r.Found, IsTrue)
 		c.Assert(r.Source["es_title"], Equals, "abc")
 	}
 
@@ -319,13 +332,16 @@ func (s *riverTestSuite) TestRiver(c *C) {
 		s.testExecute(c, fmt.Sprintf("UPDATE %s SET title = ? WHERE id = ?", table), "hello", 5+i)
 	}
 
+	// test ip
+	s.testExecute(c, "UPDATE test_river set ip = ? WHERE id = ?", 3748168280, 17)
+
 	testWaitSyncDone(c, s.r)
 
 	r = s.testElasticGet(c, "1")
-	c.Assert(r.Found, Equals, false)
+	c.Assert(r.Found, IsFalse)
 
 	r = s.testElasticGet(c, "2")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 	c.Assert(r.Source["es_title"], Equals, "second 2")
 	c.Assert(r.Source["tenum"], Equals, "e3")
 	c.Assert(r.Source["tset"], Equals, "a,b,c")
@@ -333,23 +349,56 @@ func (s *riverTestSuite) TestRiver(c *C) {
 	c.Assert(r.Source["tbit"], Equals, float64(1))
 
 	r = s.testElasticGet(c, "4")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 	c.Assert(r.Source["tenum"], Equals, "")
 	c.Assert(r.Source["tset"], Equals, "a,b,c")
 	c.Assert(r.Source["tbit"], Equals, float64(0))
 
 	r = s.testElasticGet(c, "3")
-	c.Assert(r.Found, Equals, false)
+	c.Assert(r.Found, IsFalse)
 
 	r = s.testElasticGet(c, "30")
-	c.Assert(r.Found, Equals, true)
+	c.Assert(r.Found, IsTrue)
 	c.Assert(r.Source["es_title"], Equals, "second 30")
 
 	for i := 0; i < 10; i++ {
 		r = s.testElasticGet(c, fmt.Sprintf("%d", 5+i))
-		c.Assert(r.Found, Equals, true)
+		c.Assert(r.Found, IsTrue)
 		c.Assert(r.Source["es_title"], Equals, "hello")
 	}
+
+	r = s.testElasticGet(c, "16")
+	c.Assert(r.Found, IsTrue)
+	tdt, _ := time.Parse(time.RFC3339, r.Source["tdatetime"].(string))
+	c.Assert(tdt.Format(mysql.TimeFormat), Equals, dateTimeStr)
+	c.Assert(r.Source["tdate"], Equals, dateStr)
+
+	r = s.testElasticGet(c, "20")
+	c.Assert(r.Found, IsTrue)
+	c.Assert(r.Source["tdate"], Equals, nil)
+	c.Assert(r.Source["tdatetime"], Equals, nil)
+
+	// test ip
+	r = s.testElasticGet(c, "17")
+	c.Assert(r.Found, IsTrue)
+	c.Assert(r.Source["ip"], Equals, float64(3748168280))
+
+	// alter table
+	s.testExecute(c, "ALTER TABLE test_river ADD COLUMN new INT(10)")
+	s.testExecute(c, "INSERT INTO test_river (id, title, content, tenum, tset, new) VALUES (?, ?, ?, ?, ?, ?)", 1000, "abc", "hello", "e1", "a,b,c", 1)
+	s.testExecute(c, "ALTER TABLE test_river DROP COLUMN new")
+	s.testExecute(c, "INSERT INTO test_river (id, title, content, tenum, tset) VALUES (?, ?, ?, ?, ?)", 1001, "abc", "hello", "e1", "a,b,c")
+
+	testWaitSyncDone(c, s.r)
+
+	r = s.testElasticGet(c, "1000")
+	c.Assert(r.Found, IsTrue)
+	c.Assert(r.Source["new"], Equals, float64(1))
+
+	r = s.testElasticGet(c, "1001")
+	c.Assert(r.Found, IsTrue)
+	_, ok := r.Source["new"]
+	c.Assert(ok, IsFalse)
 }
 
 func TestTableValidation(t *testing.T) {

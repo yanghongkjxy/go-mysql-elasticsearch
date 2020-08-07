@@ -4,7 +4,7 @@ It uses `mysqldump` to fetch the origin data at first, then syncs data increment
 
 ## Install
 
-+ Install Go (1.6+) and set your [GOPATH](https://golang.org/doc/code.html#GOPATH)
++ Install Go (1.9+) and set your [GOPATH](https://golang.org/doc/code.html#GOPATH)
 + `go get github.com/siddontang/go-mysql-elasticsearch`, it will print some messages in console, skip it. :-)
 + cd `$GOPATH/src/github.com/siddontang/go-mysql-elasticsearch`
 + `make`
@@ -20,6 +20,8 @@ It uses `mysqldump` to fetch the origin data at first, then syncs data increment
 
 ## Notice
 
++ MySQL supported version < 8.0
++ ES supported version < 6.0
 + binlog format must be **row**.
 + binlog row image must be **full** for MySQL, you may lost some field data if you update PK data in MySQL with minimal or noblob binlog row image. MariaDB only supports full row image.
 + Can not alter table format at runtime.
@@ -174,6 +176,21 @@ You can ignore these tables in the configuration like:
 skip_no_pk_table = true
 ```
 
+## Elasticsearch Pipeline
+You can use [Ingest Node Pipeline](https://www.elastic.co/guide/en/elasticsearch/reference/current/ingest.html) to pre-process documents before indexing, like JSON string decode, merge fileds and more.
+
+```
+[[rule]]
+schema = "test"
+table = "t1"
+index = "t"
+type = "_doc"
+
+# pipeline id
+pipeline = "my-pipeline-id"
+```
+Node: you should [create pipeline](https://www.elastic.co/guide/en/elasticsearch/reference/current/put-pipeline-api.html) manually and Elasticsearch >= 5.0.
+
 ## Why not other rivers?
 
 Although there are some other MySQL rivers for Elasticsearch, like [elasticsearch-river-jdbc](https://github.com/jprante/elasticsearch-river-jdbc), [elasticsearch-river-mysql](https://github.com/scharron/elasticsearch-river-mysql), I still want to build a new one with Go, why?
@@ -185,6 +202,8 @@ Although there are some other MySQL rivers for Elasticsearch, like [elasticsearc
 
 ## Todo
 
++ MySQL 8
++ ES 6
 + Statistic.
 
 ## Donate

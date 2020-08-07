@@ -9,18 +9,12 @@ import (
 	"time"
 
 	"github.com/juju/errors"
+	"github.com/siddontang/go-log/log"
 	"github.com/siddontang/go-mysql-elasticsearch/elastic"
 	"github.com/siddontang/go-mysql/canal"
 	"github.com/siddontang/go-mysql/mysql"
 	"github.com/siddontang/go-mysql/replication"
 	"github.com/siddontang/go-mysql/schema"
-	log "github.com/sirupsen/logrus"
-)
-
-const (
-	syncInsertDoc = iota
-	syncDeleteDoc
-	syncUpdateDoc
 )
 
 const (
@@ -29,6 +23,8 @@ const (
 	// set the [rule.field] created_time = ",date"
 	fieldTypeDate = "date"
 )
+
+const mysqlDateFormat = "2006-01-02"
 
 type posSaver struct {
 	pos   mysql.Position
@@ -41,13 +37,21 @@ type eventHandler struct {
 
 func (h *eventHandler) OnRotate(e *replication.RotateEvent) error {
 	pos := mysql.Position{
-		string(e.NextLogName),
-		uint32(e.Position),
+		Name: string(e.NextLogName),
+		Pos:  uint32(e.Position),
 	}
 
 	h.r.syncCh <- posSaver{pos, true}
 
 	return h.r.ctx.Err()
+}
+
+func (h *eventHandler) OnTableChanged(schema, table string) error {
+	err := h.r.updateRule(schema, table)
+	if err != nil && err != ErrRuleNotExist {
+		return errors.Trace(err)
+	}
+	return nil
 }
 
 func (h *eventHandler) OnDDL(nextPos mysql.Position, _ *replication.QueryEvent) error {
@@ -93,7 +97,7 @@ func (h *eventHandler) OnGTID(gtid mysql.GTIDSet) error {
 	return nil
 }
 
-func (h *eventHandler) OnPosSynced(pos mysql.Position, force bool) error {
+func (h *eventHandler) OnPosSynced(pos mysql.Position, set mysql.GTIDSet, force bool) error {
 	return nil
 }
 
@@ -183,14 +187,14 @@ func (r *River) makeRequest(rule *Rule, action string, rows [][]interface{}) ([]
 			}
 		}
 
-		req := &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: id, Parent: parentID}
+		req := &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: id, Parent: parentID, Pipeline: rule.Pipeline}
 
 		if action == canal.DeleteAction {
 			req.Action = elastic.ActionDelete
-			r.st.DeleteNum.Add(1)
+			esDeleteNum.WithLabelValues(rule.Index).Inc()
 		} else {
 			r.makeInsertReqData(req, rule, values)
-			r.st.InsertNum.Add(1)
+			esInsertNum.WithLabelValues(rule.Index).Inc()
 		}
 
 		reqs = append(reqs, req)
@@ -242,14 +246,22 @@ func (r *River) makeUpdateRequest(rule *Rule, rows [][]interface{}) ([]*elastic.
 			req.Action = elastic.ActionDelete
 			reqs = append(reqs, req)
 
-			req = &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: afterID, Parent: afterParentID}
+			req = &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: afterID, Parent: afterParentID, Pipeline: rule.Pipeline}
 			r.makeInsertReqData(req, rule, rows[i+1])
 
-			r.st.DeleteNum.Add(1)
-			r.st.InsertNum.Add(1)
+			esDeleteNum.WithLabelValues(rule.Index).Inc()
+			esInsertNum.WithLabelValues(rule.Index).Inc()
 		} else {
-			r.makeUpdateReqData(req, rule, rows[i], rows[i+1])
-			r.st.UpdateNum.Add(1)
+			if len(rule.Pipeline) > 0 {
+				// Pipelines can only be specified on index action
+				r.makeInsertReqData(req, rule, rows[i+1])
+				// Make sure action is index, not create
+				req.Action = elastic.ActionIndex
+				req.Pipeline = rule.Pipeline
+			} else {
+				r.makeUpdateReqData(req, rule, rows[i], rows[i+1])
+			}
+			esUpdateNum.WithLabelValues(rule.Index).Inc()
 		}
 
 		reqs = append(reqs, req)
@@ -314,11 +326,23 @@ func (r *River) makeReqColumnData(col *schema.TableColumn, value interface{}) in
 		if err == nil && f != nil {
 			return f
 		}
-	case schema.TYPE_DATETIME:
+	case schema.TYPE_DATETIME, schema.TYPE_TIMESTAMP:
 		switch v := value.(type) {
 		case string:
-			vt, _ := time.ParseInLocation(mysql.TimeFormat, string(v), time.Local)
+			vt, err := time.ParseInLocation(mysql.TimeFormat, string(v), time.Local)
+			if err != nil || vt.IsZero() { // failed to parse date or zero date
+				return nil
+			}
 			return vt.Format(time.RFC3339)
+		}
+	case schema.TYPE_DATE:
+		switch v := value.(type) {
+		case string:
+			vt, err := time.Parse(mysqlDateFormat, string(v))
+			if err != nil || vt.IsZero() { // failed to parse date or zero date
+				return nil
+			}
+			return vt.Format(mysqlDateFormat)
 		}
 	}
 
@@ -402,14 +426,14 @@ func (r *River) getDocID(rule *Rule, row []interface{}) (string, error) {
 		err error
 	)
 	if rule.ID == nil {
-		ids, err = canal.GetPKValues(rule.TableInfo, row)
+		ids, err = rule.TableInfo.GetPKValues(row)
 		if err != nil {
 			return "", err
 		}
 	} else {
 		ids = make([]interface{}, 0, len(rule.ID))
 		for _, column := range rule.ID {
-			value, err := canal.GetColumnValue(rule.TableInfo, column, row)
+			value, err := rule.TableInfo.GetColumnValue(column, row)
 			if err != nil {
 				return "", err
 			}

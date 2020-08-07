@@ -6,6 +6,7 @@ import (
 	"github.com/siddontang/go-mysql/schema"
 )
 
+// Rule is the rule for how to sync data from MySQL to ES.
 // If you want to sync MySQL data into elasticsearch, you must set a rule to let use know how to do it.
 // The mapping rule may thi: schema + table <-> index + document type.
 // schema and table is for MySQL, index and document type is for Elasticsearch.
@@ -27,6 +28,10 @@ type Rule struct {
 
 	//only MySQL fields in filter will be synced , default sync all fields
 	Filter []string `toml:"filter"`
+
+	// Elasticsearch pipeline
+	// To pre-process documents before indexing
+	Pipeline string `toml:"pipeline"`
 }
 
 func newDefaultRule(schema string, table string) *Rule {
@@ -65,6 +70,7 @@ func (r *Rule) prepare() error {
 	return nil
 }
 
+// CheckFilter checkers whether the field needs to be filtered.
 func (r *Rule) CheckFilter(field string) bool {
 	if r.Filter == nil {
 		return true

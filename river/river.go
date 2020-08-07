@@ -1,19 +1,22 @@
 package river
 
 import (
-	"strings"
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/juju/errors"
+	"github.com/siddontang/go-log/log"
 	"github.com/siddontang/go-mysql-elasticsearch/elastic"
 	"github.com/siddontang/go-mysql/canal"
-	log "github.com/sirupsen/logrus"
 )
 
-// In Elasticsearch, river is a pluggable service within Elasticsearch pulling data then indexing it into Elasticsearch.
+// ErrRuleNotExist is the error if rule is not defined.
+var ErrRuleNotExist = errors.New("rule is not exist")
+
+// River is a pluggable service within Elasticsearch pulling data then indexing it into Elasticsearch.
 // We use this definition here too, although it may not run within Elasticsearch.
 // Maybe later I can implement a acutal river in Elasticsearch, but I must learn java. :-)
 type River struct {
@@ -30,13 +33,12 @@ type River struct {
 
 	es *elastic.Client
 
-	st *stat
-
 	master *masterInfo
 
 	syncCh chan interface{}
 }
 
+// NewRiver creates the River from config
 func NewRiver(c *Config) (*River, error) {
 	r := new(River)
 
@@ -71,10 +73,10 @@ func NewRiver(c *Config) (*River, error) {
 	cfg.Addr = r.c.ESAddr
 	cfg.User = r.c.ESUser
 	cfg.Password = r.c.ESPassword
+	cfg.HTTPS = r.c.ESHttps
 	r.es = elastic.NewClient(cfg)
 
-	r.st = &stat{r: r}
-	go r.st.Run(r.c.StatAddr)
+	go InitStatus(r.c.StatAddr, r.c.StatPath)
 
 	return r, nil
 }
@@ -91,6 +93,12 @@ func (r *River) newCanal() error {
 	cfg.Dump.ExecutionPath = r.c.DumpExec
 	cfg.Dump.DiscardErr = false
 	cfg.Dump.SkipMasterData = r.c.SkipMasterData
+
+	for _, s := range r.c.Sources {
+		for _, t := range s.Tables {
+			cfg.IncludeTableRegex = append(cfg.IncludeTableRegex, s.Schema+"\\."+t)
+		}
+	}
 
 	var err error
 	r.canal, err = canal.NewCanal(cfg)
@@ -113,7 +121,7 @@ func (r *River) prepareCanal() error {
 	} else {
 		// many dbs, can only assign databases to dump
 		keys := make([]string, 0, len(dbs))
-		for key, _ := range dbs {
+		for key := range dbs {
 			keys = append(keys, key)
 		}
 
@@ -133,6 +141,22 @@ func (r *River) newRule(schema, table string) error {
 	}
 
 	r.rules[key] = newDefaultRule(schema, table)
+	return nil
+}
+
+func (r *River) updateRule(schema, table string) error {
+	rule, ok := r.rules[ruleKey(schema, table)]
+	if !ok {
+		return ErrRuleNotExist
+	}
+
+	tableInfo, err := r.canal.GetTable(schema, table)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	rule.TableInfo = tableInfo
+
 	return nil
 }
 
@@ -246,9 +270,9 @@ func (r *River) prepareRule() error {
 		if len(rule.TableInfo.PKColumns) == 0 {
 			if !r.c.SkipNoPkTable {
 				return errors.Errorf("%s.%s must have a PK for a column", rule.Schema, rule.Table)
-			} else {
-				log.Errorf("ignored table without a primary key: %s\n", rule.TableInfo.Name)
 			}
+
+			log.Errorf("ignored table without a primary key: %s\n", rule.TableInfo.Name)
 		} else {
 			rules[key] = rule
 		}
@@ -265,21 +289,25 @@ func ruleKey(schema string, table string) string {
 // Run syncs the data from MySQL and inserts to ES.
 func (r *River) Run() error {
 	r.wg.Add(1)
+	canalSyncState.Set(float64(1))
 	go r.syncLoop()
 
 	pos := r.master.Position()
 	if err := r.canal.RunFrom(pos); err != nil {
 		log.Errorf("start canal err %v", err)
+		canalSyncState.Set(0)
 		return errors.Trace(err)
 	}
 
 	return nil
 }
 
+// Ctx returns the internal context for outside use.
 func (r *River) Ctx() context.Context {
 	return r.ctx
 }
 
+// Close closes the River
 func (r *River) Close() {
 	log.Infof("closing river")
 
